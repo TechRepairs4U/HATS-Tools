@@ -23,12 +23,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Post to X
+        env:
+          REPO: ${{ github.repository }}
+          TITLE: ${{ inputs.release_title || github.event.release.name }}
+          NOTES: ${{ inputs.release_notes || github.event.release.body }}
+          TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
+          X_API_KEY: ${{ secrets.X_API_KEY }}
+          X_API_KEY_SECRET: ${{ secrets.X_API_KEY_SECRET }}
+          X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
+          X_ACCESS_TOKEN_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET }}
         run: |
-          REPO="${{ github.repository }}"
-          TITLE="${{ inputs.release_title || github.event.release.name }}"
-          NOTES="${{ inputs.release_notes || github.event.release.body }}"
-          TAG="${{ inputs.release_tag || github.event.release.tag_name }}"
           URL="https://github.com/$REPO/releases/tag/$TAG"
+          export URL
 
           echo "Posting to X.com..."
 
@@ -44,7 +50,6 @@ jobs:
           url = os.environ['URL']
 
           def extract_sections(notes):
-              """Extract bullet points from Added/Fixed/Improved/Changes sections."""
               results = {}
               for section in ['Added', 'Fixed', 'Improved', 'Changes']:
                   pattern = rf'###\s+{section}\s*\n((?:[-*]\s+.+\n?)+)'
@@ -66,7 +71,8 @@ jobs:
               for item in sections.get(section, [])[:2]:
                   short = item.split(' - ')[0].split(':')[0].strip()
                   short = short[:60]
-                  highlights.append(f"{'[+]' if section == 'Added' else '[fix]' if section == 'Fixed' else '[~]'} {short}")
+                  prefix = '[+]' if section == 'Added' else '[fix]' if section == 'Fixed' else '[~]'
+                  highlights.append(f"{prefix} {short}")
               if len(highlights) >= 4:
                   break
 
@@ -102,11 +108,3 @@ jobs:
           print("Tweet posted successfully!")
           print(f"Tweet URL: https://x.com/user/status/{response.json()['data']['id']}")
           EOF
-        env:
-          NOTES: $NOTES
-          TITLE: $TITLE
-          URL: $URL
-          X_API_KEY: ${{ secrets.X_API_KEY }}
-          X_API_KEY_SECRET: ${{ secrets.X_API_KEY_SECRET }}
-          X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
-          X_ACCESS_TOKEN_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET }}
