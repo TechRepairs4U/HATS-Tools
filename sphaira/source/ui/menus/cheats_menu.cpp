@@ -189,25 +189,41 @@ auto StringsEqualIgnoreCase(const std::string& a, const std::string& b) -> bool 
     });
 }
 
-auto GetBuildIdFromInstalledNca(u64 title_id) -> std::string {
+enum class InstalledNcaFailureReason {
+    None,
+    NotInstalled,
+    ContentMissing,
+    Unavailable,
+};
+
+struct InstalledNcaLookupResult {
+    std::string build_id;
+    InstalledNcaFailureReason failure_reason{InstalledNcaFailureReason::None};
+};
+
+auto GetBuildIdFromInstalledNcaDetailed(u64 title_id) -> InstalledNcaLookupResult {
+    InstalledNcaLookupResult result;
     Result rc = ns::Initialize();
     if (R_FAILED(rc)) {
         log_write("[Cheats] GetBuildIdFromInstalledNca: ns::Initialize failed for %016lx: %x\n", title_id, rc);
-        return "";
+        result.failure_reason = InstalledNcaFailureReason::Unavailable;
+        return result;
     }
     ON_SCOPE_EXIT(ns::Exit());
 
     s32 count = 0;
     if (R_FAILED(nsCountApplicationContentMeta(title_id, &count)) || count <= 0) {
         log_write("[Cheats] GetBuildIdFromInstalledNca: no meta entries for title %016lx\n", title_id);
-        return "";
+        result.failure_reason = InstalledNcaFailureReason::NotInstalled;
+        return result;
     }
 
     std::vector<NsApplicationContentMetaStatus> entries(count);
     s32 entries_read = 0;
     if (R_FAILED(nsListApplicationContentMetaStatus(title_id, 0, entries.data(), entries.size(), &entries_read)) || entries_read <= 0) {
         log_write("[Cheats] GetBuildIdFromInstalledNca: failed to list meta entries for title %016lx\n", title_id);
-        return "";
+        result.failure_reason = InstalledNcaFailureReason::Unavailable;
+        return result;
     }
     entries.resize(entries_read);
 
@@ -233,7 +249,11 @@ auto GetBuildIdFromInstalledNca(u64 title_id) -> std::string {
     if (!best_status) {
         log_write("[Cheats] GetBuildIdFromInstalledNca: no supported storage entries for title %016lx\n",
                   title_id);
-        return "";
+        // Metadata can still linger even when the actual title content/NCA is gone.
+        // If we found entries but none point to a readable user/SD/gamecard storage,
+        // treat this like missing content instead of a clean "not installed" state.
+        result.failure_reason = InstalledNcaFailureReason::ContentMissing;
+        return result;
     }
 
     log_write("[Cheats] GetBuildIdFromInstalledNca: selected meta app=%016lx version=%u storage=%u type=%u\n",
@@ -243,7 +263,8 @@ auto GetBuildIdFromInstalledNca(u64 title_id) -> std::string {
     rc = ncmOpenContentMetaDatabase(&db, static_cast<NcmStorageId>(best_status->storageID));
     if (R_FAILED(rc)) {
         log_write("[Cheats] GetBuildIdFromInstalledNca: failed to open metadata DB for title %016lx: %x\n", title_id, rc);
-        return "";
+        result.failure_reason = InstalledNcaFailureReason::ContentMissing;
+        return result;
     }
     ON_SCOPE_EXIT(ncmContentMetaDatabaseClose(&db));
 
@@ -251,7 +272,8 @@ auto GetBuildIdFromInstalledNca(u64 title_id) -> std::string {
     rc = ncmOpenContentStorage(&cs, static_cast<NcmStorageId>(best_status->storageID));
     if (R_FAILED(rc)) {
         log_write("[Cheats] GetBuildIdFromInstalledNca: failed to open content storage for title %016lx: %x\n", title_id, rc);
-        return "";
+        result.failure_reason = InstalledNcaFailureReason::ContentMissing;
+        return result;
     }
     ON_SCOPE_EXIT(ncmContentStorageClose(&cs));
 
@@ -259,21 +281,24 @@ auto GetBuildIdFromInstalledNca(u64 title_id) -> std::string {
     rc = ncmContentMetaDatabaseGetLatestContentMetaKey(&db, &key, best_status->application_id);
     if (R_FAILED(rc)) {
         log_write("[Cheats] GetBuildIdFromInstalledNca: failed to resolve latest content meta key for %016lx: %x\n", title_id, rc);
-        return "";
+        result.failure_reason = InstalledNcaFailureReason::ContentMissing;
+        return result;
     }
 
     NcmContentId content_id{};
     rc = ncmContentMetaDatabaseGetContentIdByType(&db, &content_id, &key, NcmContentType_Program);
     if (R_FAILED(rc)) {
         log_write("[Cheats] GetBuildIdFromInstalledNca: failed to resolve Program content ID for %016lx: %x\n", title_id, rc);
-        return "";
+        result.failure_reason = InstalledNcaFailureReason::ContentMissing;
+        return result;
     }
 
     fs::FsPath mount_path;
     rc = devoptab::MountNcaNcm(&cs, &content_id, mount_path);
     if (R_FAILED(rc)) {
         log_write("[Cheats] GetBuildIdFromInstalledNca: failed to mount Program NCA for %016lx: %x\n", title_id, rc);
-        return "";
+        result.failure_reason = InstalledNcaFailureReason::ContentMissing;
+        return result;
     }
     ON_SCOPE_EXIT(devoptab::UmountNeworkDevice(mount_path));
 
@@ -294,7 +319,8 @@ auto GetBuildIdFromInstalledNca(u64 title_id) -> std::string {
         LogMountedDirectoryEntries(mounted_fs, "/exeFS");
         LogMountedDirectoryEntries(mounted_fs, "/RomFS");
         LogMountedDirectoryEntries(mounted_fs, "/Logo");
-        return "";
+        result.failure_reason = InstalledNcaFailureReason::ContentMissing;
+        return result;
     }
 
     u8 module_id[0x20]{};
@@ -303,18 +329,25 @@ auto GetBuildIdFromInstalledNca(u64 title_id) -> std::string {
     if (R_FAILED(rc) || bytes_read < 8) {
         log_write("[Cheats] GetBuildIdFromInstalledNca: failed to read ModuleId from %s for %016lx: %x (read=%llu)\n",
                   opened_path, title_id, rc, bytes_read);
-        return "";
+        result.failure_reason = InstalledNcaFailureReason::ContentMissing;
+        return result;
     }
 
     const auto build_id = NormalizeBuildId(BytesToHex(module_id, 8));
     if (!IsValidBuildId(build_id)) {
         log_write("[Cheats] GetBuildIdFromInstalledNca: invalid Build ID for %016lx: %s\n", title_id, build_id.c_str());
-        return "";
+        result.failure_reason = InstalledNcaFailureReason::Unavailable;
+        return result;
     }
 
     log_write("[Cheats] GetBuildIdFromInstalledNca: build ID = %s for title %016lx via %s\n",
               build_id.c_str(), title_id, opened_path);
-    return build_id;
+    result.build_id = build_id;
+    return result;
+}
+
+auto GetBuildIdFromInstalledNca(u64 title_id) -> std::string {
+    return GetBuildIdFromInstalledNcaDetailed(title_id).build_id;
 }
 
 // Get Build ID from dmnt:cht service (when game is running/suspended)
@@ -522,6 +555,116 @@ auto GetBuildIdFromNso(u64 title_id) -> std::string {
 
     log_write("[Cheats] GetBuildIdFromNso: exhausted all storage/path combinations for title %016lx\n", title_id);
     return "";
+}
+
+enum class BuildIdFailureReason {
+    None,
+    ProdKeysMissing,
+    GameNotFound,
+    ExactBuildIdUnavailable,
+};
+
+struct BuildIdLookupResult {
+    std::string build_id;
+    std::string source;
+    BuildIdFailureReason failure_reason{BuildIdFailureReason::None};
+};
+
+auto HasProdKeys() -> bool {
+    fs::FsNativeSd fs;
+    return fs.FileExists("/switch/prod.keys");
+}
+
+auto HasApplicationContentMeta(u64 title_id) -> bool {
+    Result rc = ns::Initialize();
+    if (R_FAILED(rc)) {
+        log_write("[Cheats] HasApplicationContentMeta: ns::Initialize failed for %016lx: %x\n", title_id, rc);
+        return false;
+    }
+    ON_SCOPE_EXIT(ns::Exit());
+
+    s32 count = 0;
+    rc = nsCountApplicationContentMeta(title_id, &count);
+    if (R_FAILED(rc)) {
+        log_write("[Cheats] HasApplicationContentMeta: nsCountApplicationContentMeta failed for %016lx: %x\n", title_id, rc);
+        return false;
+    }
+
+    return count > 0;
+}
+
+auto LookupBuildIdForCheats(u64 title_id, bool allow_nso_fallback = true) -> BuildIdLookupResult {
+    BuildIdLookupResult result;
+
+    result.build_id = GetBuildIdFromDmnt(title_id);
+    if (!result.build_id.empty()) {
+        result.build_id = NormalizeBuildId(result.build_id);
+        result.source = "dmnt";
+        return result;
+    }
+
+    const bool has_prod_keys = HasProdKeys();
+    if (!has_prod_keys) {
+        log_write("[Cheats] LookupBuildIdForCheats: /switch/prod.keys not found\n");
+    } else {
+        const auto installed_nca = GetBuildIdFromInstalledNcaDetailed(title_id);
+        result.build_id = installed_nca.build_id;
+        if (!result.build_id.empty()) {
+            result.source = "installed-nca";
+            return result;
+        }
+
+        if (installed_nca.failure_reason == InstalledNcaFailureReason::ContentMissing) {
+            log_write("[Cheats] LookupBuildIdForCheats: installed Program NCA content missing for %016lx\n", title_id);
+            result.failure_reason = BuildIdFailureReason::GameNotFound;
+            return result;
+        }
+    }
+
+    if (allow_nso_fallback) {
+        result.build_id = GetBuildIdFromNso(title_id);
+        if (!result.build_id.empty()) {
+            result.build_id = NormalizeBuildId(result.build_id);
+            result.source = "nso";
+            return result;
+        }
+    }
+
+    if (!has_prod_keys) {
+        result.failure_reason = BuildIdFailureReason::ProdKeysMissing;
+        return result;
+    }
+
+    if (!HasApplicationContentMeta(title_id)) {
+        result.failure_reason = BuildIdFailureReason::GameNotFound;
+        return result;
+    }
+
+    // If we're in application mode and both installed-content probes failed,
+    // the title entry is present but the actual game data is very likely gone.
+    if (allow_nso_fallback && App::IsApplication()) {
+        result.failure_reason = BuildIdFailureReason::GameNotFound;
+        return result;
+    }
+
+    result.failure_reason = BuildIdFailureReason::ExactBuildIdUnavailable;
+    return result;
+}
+
+auto GetBuildIdFailureMessage(BuildIdFailureReason reason) -> std::string {
+    switch (reason) {
+        case BuildIdFailureReason::ProdKeysMissing:
+            return "prod.keys not found";
+        case BuildIdFailureReason::GameNotFound:
+            return "No game found";
+        case BuildIdFailureReason::ExactBuildIdUnavailable:
+            return "Unable to determine the exact Build ID.\n\n"
+                   "For reliable cheat matching, launch the game first\n"
+                   "or retry from a mode where installed-title code can be read.";
+        case BuildIdFailureReason::None:
+        default:
+            return {};
+    }
 }
 
 // Get version for a title (like aio-switch-updater does)
@@ -3754,6 +3897,7 @@ void CheatDownloadMenu::FetchCheats() {
     m_loading = true;
     m_error_message.clear();
     m_cheats.clear();
+    m_should_close = false;
 
     // nx-cheats-db and CheatSlips both require an exact Build ID match.
     if (m_source == CheatSource::NxDb) {
@@ -3770,47 +3914,32 @@ void CheatDownloadMenu::FetchCheats() {
         return;
     }
 
-    log_write("[Cheats] Trying dmnt:cht service first\n");
-    std::string build_id = GetBuildIdFromDmnt(m_game.title_id);
-
-    if (!build_id.empty()) {
-        // Successfully got Build ID from running game
-        m_game.build_id = NormalizeBuildId(build_id);
-        SaveDetectedBuildIdToCache(m_game, m_game.build_id, "dmnt");
-        log_write("[Cheats] Got Build ID from dmnt:cht: %s\n", m_game.build_id.c_str());
-        FetchCheatsFromApi(m_game.build_id);
-        return;
-    }
-
-    build_id = GetBuildIdFromInstalledNca(m_game.title_id);
-    if (!build_id.empty()) {
-        m_game.build_id = NormalizeBuildId(build_id);
-        SaveDetectedBuildIdToCache(m_game, m_game.build_id, "installed-nca");
-        log_write("[Cheats] Got Build ID from installed Program NCA: %s\n", m_game.build_id.c_str());
-        FetchCheatsFromApi(m_game.build_id);
-        return;
-    }
-
-    build_id = GetBuildIdFromNso(m_game.title_id);
-    if (!build_id.empty()) {
-        m_game.build_id = NormalizeBuildId(build_id);
-        SaveDetectedBuildIdToCache(m_game, m_game.build_id, "nso");
-        log_write("[Cheats] Got Build ID from NSO: %s\n", m_game.build_id.c_str());
+    const auto lookup = LookupBuildIdForCheats(m_game.title_id);
+    if (!lookup.build_id.empty()) {
+        m_game.build_id = lookup.build_id;
+        SaveDetectedBuildIdToCache(m_game, m_game.build_id, lookup.source.c_str());
+        log_write("[Cheats] Got Build ID from %s: %s\n", lookup.source.c_str(), m_game.build_id.c_str());
         FetchCheatsFromApi(m_game.build_id);
         return;
     }
 
     m_loading = false;
     m_loaded = true;
-    m_error_message = "Unable to determine the exact Build ID.\n\n"
-                      "For reliable cheat matching, launch the game first\n"
-                      "or retry from a mode where installed-title code can be read.";
-    log_write("[Cheats] Exact Build ID detection failed for CheatSlips\n");
+    m_error_message = GetBuildIdFailureMessage(lookup.failure_reason);
+    log_write("[Cheats] Exact Build ID detection failed for CheatSlips, reason=%d\n",
+              static_cast<int>(lookup.failure_reason));
+
+    if (lookup.failure_reason == BuildIdFailureReason::ProdKeysMissing ||
+        lookup.failure_reason == BuildIdFailureReason::GameNotFound) {
+        App::Notify(m_error_message);
+        m_should_close = true;
+    }
 }
 
 // Fetch cheats from nx-cheats-db on GitHub
 void CheatDownloadMenu::FetchCheatsFromNxDb() {
     log_write("[Cheats] Fetching cheats from nx-cheats-db (GitHub)\n");
+    m_should_close = false;
 
     if (const auto cached_build_id = GetCachedBuildIdForTitle(m_game); !cached_build_id.empty()) {
         m_game.build_id = cached_build_id;
@@ -3818,42 +3947,28 @@ void CheatDownloadMenu::FetchCheatsFromNxDb() {
         return;
     }
 
-    // 1st: dmnt:cht — requires game suspended in background (applet mode)
-    std::string build_id = GetBuildIdFromDmnt(m_game.title_id);
-
-    if (!build_id.empty()) {
-        m_game.build_id = NormalizeBuildId(build_id);
-        SaveDetectedBuildIdToCache(m_game, m_game.build_id, "dmnt");
-        log_write("[Cheats] Got Build ID from dmnt:cht: %s\n", m_game.build_id.c_str());
+    const auto lookup = LookupBuildIdForCheats(m_game.title_id);
+    if (!lookup.build_id.empty()) {
+        m_game.build_id = lookup.build_id;
+        SaveDetectedBuildIdToCache(m_game, m_game.build_id, lookup.source.c_str());
+        log_write("[Cheats] Got Build ID from %s: %s\n", lookup.source.c_str(), m_game.build_id.c_str());
         FetchNxDbCheatsFromGithub(m_game.build_id);
         return;
     }
 
-    // 2nd: installed Program NCA from content storage
-    build_id = GetBuildIdFromInstalledNca(m_game.title_id);
-
-    if (!build_id.empty()) {
-        m_game.build_id = NormalizeBuildId(build_id);
-        SaveDetectedBuildIdToCache(m_game, m_game.build_id, "installed-nca");
-        log_write("[Cheats] Got Build ID from installed Program NCA: %s\n", m_game.build_id.c_str());
-        FetchNxDbCheatsFromGithub(m_game.build_id);
+    if (lookup.failure_reason == BuildIdFailureReason::ProdKeysMissing ||
+        lookup.failure_reason == BuildIdFailureReason::GameNotFound) {
+        m_loading = false;
+        m_loaded = true;
+        m_error_message = GetBuildIdFailureMessage(lookup.failure_reason);
+        App::Notify(m_error_message);
+        m_should_close = true;
         return;
     }
 
-    // 3rd: fsp-ldr — reads directly from installed NSO (non-applet/application mode only)
-    build_id = GetBuildIdFromNso(m_game.title_id);
-
-    if (!build_id.empty()) {
-        m_game.build_id = NormalizeBuildId(build_id);
-        SaveDetectedBuildIdToCache(m_game, m_game.build_id, "nso");
-        log_write("[Cheats] Got Build ID from NSO: %s\n", m_game.build_id.c_str());
-        FetchNxDbCheatsFromGithub(m_game.build_id);
-        return;
-    }
-
-    // 4th: refuse to guess from version maps. Inspect the cheats file directly
+    // Refuse to guess from version maps. Inspect the cheats file directly
     // and only proceed when there is a single unambiguous candidate.
-    log_write("[Cheats] dmnt:cht and NSO both failed, inspecting cheats file directly\n");
+    log_write("[Cheats] Exact Build ID lookup failed, inspecting cheats file directly\n");
     FetchCheatsFileAndExtractBuildIds();
 }
 
